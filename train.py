@@ -34,28 +34,32 @@ from export import model_export
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000
+eval_interval = 100
 log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
-always_save_checkpoint = False  # if True, always save a checkpoint after each eval
+always_save_checkpoint = True  # if True, always save a checkpoint after each eval
 init_from = "scratch"  # 'scratch' or 'resume'
 # wandb logging
 wandb_log = False  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-max_seq_len = 256
+batch_size = 8  # if gradient_accumulation_steps > 1, this is the micro-batch size
+max_seq_len = 512
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
-vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
+vocab_size = 55296 # the Llama 2 tokenizer has 32K tokens
 # model
-dim = 288
+dim = 324 #其实就是嵌入后的大小embed_dim
 n_layers = 6
-n_heads = 6
-n_kv_heads = 6
-multiple_of = 32
 dropout = 0.0
+# 新的超参数
+num_tasks = 12
+task_dim = 27
+num_experts = 24
+diversity_weight = 0.1
+topk = 8
+intermediate_dim = dim//2
 # adamw optimizer
 gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 learning_rate = 5e-4  # max learning rate
@@ -68,9 +72,9 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "cpu"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
-compile = True  # use PyTorch 2.0 to compile the model to be faster
+compile = False  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -87,7 +91,7 @@ min_lr = 0.0  # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # validating checks
 assert vocab_source in ["llama2", "custom"]
-assert vocab_source == "custom" or vocab_size == 32000, "The vocab from Meta has 32K tokens"
+assert vocab_source == "custom" or vocab_size == 55296, "The vocab from Meta has 32K tokens"
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
@@ -146,13 +150,18 @@ best_val_loss = 1e9
 # model init
 model_args = dict(
     dim=dim,
-    n_layers=n_layers,
-    n_heads=n_heads,
-    n_kv_heads=n_kv_heads,
-    vocab_size=vocab_size,
-    multiple_of=multiple_of,
-    max_seq_len=max_seq_len,
+    n_layers=n_layers, 
+    vocab_size=vocab_size, 
+    multiple_of=256,
+    max_seq_len=max_seq_len,  
     dropout=dropout,
+    # 新的超参数
+    num_tasks = num_tasks,
+    task_dim = task_dim,
+    num_experts = num_experts,
+    diversity_weight = diversity_weight,
+    topk = topk,
+    intermediate_dim = intermediate_dim,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -167,7 +176,11 @@ elif init_from == "resume":
     checkpoint_model_args = checkpoint["model_args"]
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["dim", "n_layers", "n_heads", "n_kv_heads", "vocab_size", "multiple_of", "max_seq_len"]:
+    for k in [
+        "dim", "n_layers", "vocab_size", "task_dim", 
+        "num_experts", "n_heads", "multiple_of", "max_seq_len", "num_tasks", "topk", "intermediate_dim"
+        "diversity_weight"  
+    ]:
         model_args[k] = checkpoint_model_args[k]
     # create the model
     gptconf = ModelArgs(**model_args)
@@ -288,7 +301,6 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
-                model_export(raw_model, os.path.join(out_dir, "model.bin"), version=0)
     if iter_num == 0 and eval_only:
         break
 

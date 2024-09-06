@@ -17,11 +17,20 @@ class ModelArgs:
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
     vocab_size: int = 32000
-    hidden_dim: Optional[int] = None
+    hidden_dim: Optional[int] = 200
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
+
+    # 添加你的模型所需的超参数
+    num_tasks: int = 2
+    task_dim: int = 32
+    num_experts: int = 32
+    diversity_weight: float = 0.1
+    attribute_dim: int = num_tasks * task_dim
+    topk: int = 2
+    intermediate_dim: int = 628
 
 
 class RMSNorm(torch.nn.Module):
@@ -90,122 +99,215 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
-
-class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    
+class TaskEncoder(nn.Module):
+    def __init__(self, hidden_dim, num_tasks, task_dim):
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        assert args.n_heads % self.n_kv_heads == 0
-        model_parallel_size = 1
-        self.n_local_heads = args.n_heads // model_parallel_size
-        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
-        self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
-        self.dropout = args.dropout
+        self.hidden_dim = hidden_dim
+        self.num_tasks = num_tasks
+        self.task_dim = task_dim
+        
+        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads=4)
+        self.task_division = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_tasks)
+        )
+        self.task_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, task_dim)
+            ) for _ in range(num_tasks)
+        ])
+        
+    def forward(self, input_seq):
+                # input_seq: (batch_size, seq_len, hidden_dim)
+        attn_output, _ = self.self_attn(input_seq, input_seq, input_seq)
+                # attn_output: (batch_size, seq_len, hidden_dim)
+        task_probs = F.softmax(self.task_division(attn_output), dim=-1)
+                # task_probs: (batch_size, seq_len, num_tasks)
+        task_embeddings = []
+        for i in range(self.num_tasks):
+            task_input = attn_output * task_probs[:, :, i].unsqueeze(-1)
+                        # task_input: (batch_size, seq_len, hidden_dim)
+            task_embeddings.append(self.task_encoders[i](task_input))
+                        # task_embeddings[i]: (batch_size, seq_len, task_dim)
+        task_embeddings = torch.stack(task_embeddings, dim=1)
+                # task_embeddings: (batch_size, num_tasks, seq_len, task_dim)    
+        task_embeddings = task_embeddings.transpose(1, 2)
+                # task_embeddings: (batch_size, seq_len, num_tasks, task_dim)
+        return task_embeddings
 
-        # use flash attention or a manual implementation?
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            self.register_buffer("mask", mask)
+class TaskAwareRouter(nn.Module):
+    def __init__(self, hidden_dim, num_experts, num_tasks, task_dim, topk):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.num_tasks = num_tasks
+        self.task_dim = task_dim
+        self.topk = topk
+        self.attribute_proj = nn.Parameter(torch.randn(task_dim, num_experts))
+        
+        self.input_proj = nn.Linear(hidden_dim + task_dim * num_tasks, hidden_dim * 4)
+        self.intermediate_proj = nn.Linear(hidden_dim * 4, hidden_dim)
+        self.expert_proj = nn.Parameter(torch.randn(num_experts, hidden_dim))
+        self.router = nn.Sequential(
+            nn.Linear(hidden_dim, num_experts),
+            nn.Softmax(dim=-1)
+        )
+        
+    def forward(self, x, task_embeddings):
+        input_vec = torch.cat([x, task_embeddings.reshape(x.size(0), x.size(1), -1)], dim=-1)
+        input_vec = F.relu(self.input_proj(input_vec))
+        input_vec = F.relu(self.intermediate_proj(input_vec))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
-    ):
-        bsz, seqlen, _ = x.shape
+        expert_probs = self.router(input_vec)
 
-        # QKV
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        attribute_scores = torch.matmul(task_embeddings, self.attribute_proj)
+        attribute_probs = torch.softmax(attribute_scores, dim=-1)  
+        attribute_probs = attribute_probs.mean(dim=2)              
 
-        # RoPE relative positional embeddings
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+        expert_probs = expert_probs * attribute_probs
 
-        # grouped multiquery attention: expand out keys and values
-        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        _, topk_indices = torch.topk(expert_probs, k=self.topk, dim=-1)
+        mask = torch.zeros_like(expert_probs).scatter_(-1, topk_indices, 1.0)
+        expert_probs = expert_probs * mask
 
-        # make heads into a batch dimension
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
+        entropy_loss = -torch.mean(torch.sum(expert_probs * torch.log(expert_probs + 1e-8), dim=-1)) 
 
-        # flash implementation
-        if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        return expert_probs, entropy_loss, mask
+
+class MoAExpert(nn.Module):
+    def __init__(self, hidden_dim, attribute_dim, intermediate_dim):
+        super(MoAExpert, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.attribute_dim = attribute_dim
+        self.intermediate_dim = intermediate_dim
+        
+        self.attribute_embedding = nn.Parameter(torch.randn(1, attribute_dim))
+        self.attribute_proj = nn.Linear(attribute_dim, hidden_dim)
+        
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.Linear(intermediate_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.Linear(intermediate_dim, hidden_dim)
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        
+    def forward(self, x):
+        residual = x
+        attribute_expanded = self.attribute_embedding.expand(x.size(0), x.size(1), -1)
+        attribute_projected = self.attribute_proj(attribute_expanded)
+        
+        gate_input = torch.cat([x, attribute_projected], dim=-1)
+        gate = self.gate(gate_input)
+        
+        x = x * gate + attribute_projected * (1 - gate)
+        x = self.fc(x)
+        x = self.layer_norm(x + residual)
+        return x
+
+class MoELayer(nn.Module):
+    def __init__(self, hidden_dim, num_experts, task_dim, num_tasks, topk, intermediate_dim):
+        super(MoELayer, self).__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([MoAExpert(hidden_dim, task_dim * num_tasks, intermediate_dim) for _ in range(num_experts)])
+        self.router = TaskAwareRouter(hidden_dim, num_experts, num_tasks, task_dim, topk)
+        
+    def forward(self, x, task_embeddings):
+        expert_probs, diversity_loss, mask = self.router(x, task_embeddings)
+        expert_outputs = []
+        for i, expert in enumerate(self.experts):
+            if mask[:, :, i].any():
+                expert_output = expert(x)
+            else:
+                expert_output = torch.zeros_like(x)
+            expert_outputs.append(expert_output)
+        expert_outputs = torch.stack(expert_outputs, dim=0)
+        
+        expert_probs = expert_probs.transpose(1, 2).unsqueeze(-1)
+        expert_outputs = expert_outputs.transpose(0, 1)
+        final_output = torch.sum(expert_probs * expert_outputs, dim=1)
+        expert_probs = expert_probs.squeeze(-1).transpose(1, 2)
+        expert_probs = torch.softmax(expert_probs, dim=-1)
+        
+        return final_output, diversity_loss
+
+class LRU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, batch_first=False):
+        super(LRU, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.batch_first = batch_first
+        self.weight_ih = nn.Parameter(torch.Tensor(hidden_dim, input_dim))
+        self.weight_hh = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim))
+        self.bias = nn.Parameter(torch.Tensor(hidden_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden_dim)
+        for weight in self.parameters():
+            nn.init.uniform_(weight, -stdv, stdv)
+
+    def forward(self, input, hx=None):
+        if self.batch_first:
+            input = input.transpose(0, 1)
+        seq_len, batch_size, _ = input.size()
+        if hx is None:
+            hx = torch.zeros(batch_size, self.hidden_dim, dtype=input.dtype, device=input.device)
+        
+        hy = []
+        for i in range(seq_len):
+            hx = F.linear(input[i], self.weight_ih, self.bias) + F.linear(hx, self.weight_hh)
+            hy.append(hx)
+        
+        if self.batch_first:
+            hy = torch.stack(hy, dim=1)
         else:
-            # manual implementation
-            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
-
-        # restore time as batch dimension and concat heads
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-
-        # final projection into the residual stream
-        output = self.wo(output)
-        output = self.resid_dropout(output)
-        return output
-
-
-class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
+            hy = torch.stack(hy, dim=0)
+        return hy
+    
+class LRUConnector(nn.Module):
+    def __init__(self, input_dim, hidden_dim, mem_seq_len):
         super().__init__()
-        if hidden_dim is None:
-            hidden_dim = 4 * dim
-            hidden_dim = int(2 * hidden_dim / 3)
-            hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.mem_seq_len = mem_seq_len
+        self.lru = LRU(input_dim, hidden_dim, batch_first=True)
 
     def forward(self, x):
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
-        super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
-        self.feed_forward = FeedForward(
-            dim=args.dim,
-            hidden_dim=args.hidden_dim,
-            multiple_of=args.multiple_of,
-            dropout=args.dropout,
-        )
-        self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-
-    def forward(self, x, freqs_cos, freqs_sin):
-        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
-        out = h + self.feed_forward.forward(self.ffn_norm(h))
-        return out
-
+        # x: (batch_size, seq_len, input_dim)
+        batch_size, seq_len, _ = x.shape
+        
+        # 确保序列可以被 mem_seq_len 整除
+        padded_len = ((seq_len - 1) // self.mem_seq_len + 1) * self.mem_seq_len
+        padded_x = F.pad(x, (0, 0, 0, padded_len - seq_len))
+        
+        # 重塑为 (batch_size, num_chunks, mem_seq_len, input_dim)
+        x_reshaped = padded_x.view(batch_size, -1, self.mem_seq_len, x.size(2))
+        
+        # 合并 batch_size 和 num_chunks 维度以适应 lru
+        x_merged = x_reshaped.view(-1, self.mem_seq_len, x.size(2))
+        
+        # 通过 lru
+        output = self.lru(x_merged)
+        
+        # 恢复原始的维度结构
+        output = output.view(batch_size, -1, self.mem_seq_len, output.size(2))
+        
+        # 移除填充
+        output = output[:, :, :seq_len, :]
+        
+        return output.reshape(batch_size, seq_len, -1)
 
 class Transformer(nn.Module):
-    last_loss: Optional[torch.Tensor]
-
     def __init__(self, params: ModelArgs):
         super().__init__()
         self.params = params
@@ -213,30 +315,19 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+        self.task_encoder = TaskEncoder(params.dim, params.num_tasks, params.task_dim)
         self.dropout = nn.Dropout(params.dropout)
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        
+        self.moe_layers = nn.ModuleList([
+            MoELayer(params.dim, params.num_experts, params.task_dim, params.num_tasks, params.topk, params.intermediate_dim) for _ in range(params.n_layers)
+        ])
+        self.norm = RMSNorm(params.dim, eps=1e-5)
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
-        # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
-
-        # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
-        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
-        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
-
-        # init all weights
+        self.tok_embeddings.weight = self.output.weight
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
-
-        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
         self.last_loss = None
+        self.lru_connector = LRUConnector(params.dim, params.dim, mem_seq_len=256)  # 假设 mem_seq_len=512
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -247,25 +338,32 @@ class Transformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
-        _bsz, seqlen = tokens.shape
+                # tokens: (batch_size, seq_len)
         h = self.tok_embeddings(tokens)
+        h = self.lru_connector(h)  # 应用LRU连接器处理
+        task_embeddings = self.task_encoder(h)
+                # h: (batch_size, seq_len, hidden_dim)
         h = self.dropout(h)
-        freqs_cos = self.freqs_cos[:seqlen]
-        freqs_sin = self.freqs_sin[:seqlen]
+                # h: (batch_size, seq_len, hidden_dim)
 
-        for layer in self.layers:
-            h = layer(h, freqs_cos, freqs_sin)
+
+        loss = 0
+        for layer in self.moe_layers:
+            h, diversity_loss = layer(h, task_embeddings)
+                        # h: (batch_size, seq_len, hidden_dim)
+            
+            loss += diversity_loss
         h = self.norm(h)
-
+                # h: (batch_size, seq_len, hidden_dim)
+        
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss += self.params.diversity_weight * diversity_loss
+            self.last_loss = loss
         else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.output(h[:, [-1], :])
             self.last_loss = None
-
         return logits
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
